@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+#	keepassxcfilter - Filtering for KeepassXC database files
+#	Copyright (C) 2020-2020 Johannes Bauer
+#
+#	This file is part of keepassxcfilter.
+#
+#	keepassxcfilter is free software; you can redistribute it and/or modify
+#	it under the terms of the GNU General Public License as published by
+#	the Free Software Foundation; this program is ONLY licensed under
+#	version 3 of the License, later versions are explicitly excluded.
+#
+#	keepassxcfilter is distributed in the hope that it will be useful,
+#	but WITHOUT ANY WARRANTY; without even the implied warranty of
+#	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#	GNU General Public License for more details.
+#
+#	You should have received a copy of the GNU General Public License
+#	along with keepassxcfilter; if not, write to the Free Software
+#	Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#
+#	Johannes Bauer <JohannesBauer@gmx.de>
+
+import os
+import sys
+import tempfile
+import subprocess
+import getpass
+import argparse
+import xml.etree.ElementTree
+from FriendlyArgumentParser import FriendlyArgumentParser
+
+parser = FriendlyArgumentParser(description = "Filter a KeepassXC database.")
+parser.add_argument("-t", "--tag", metavar = "tag", type = str, action = "append", default = [ ], help = "Include only those entries in the filtered database which have the tag present. Can be specified multiple times.")
+parser.add_argument("-f", "--force", action = "store_true", help = "Overwrite output filename if it exists.")
+parser.add_argument("--tempdir", metavar = "path", type = str, default = "/dev/shm", help = "Temporary directory in which unencrypted files will need to be stored. Ideally on a drive that is in-memory only (ramdisk or tmpfs). Defaults to %(default)s.")
+parser.add_argument("--keepass-cli-binary", metavar = "path", type = str, default = "keepassxc-cli", help = "Name (and maybe path) of the KeepassXC CLI binary. Defaults to %(default)s.")
+parser.add_argument("--export-debug-data", action = "store_true", help = argparse.SUPPRESS)
+parser.add_argument("infile", metavar = "infile", type = str, help = "Input KeepassXC database file")
+parser.add_argument("outfile", metavar = "outfile", type = str, help = "Output KeepassXC database file")
+args = parser.parse_args(sys.argv[1:])
+
+class XMLFilter():
+	def __init__(self, args):
+		self._args = args
+		self._total_entries = 0
+		self._exported_entries = 0
+		self._xml = None
+		self._recycle_bin_uuid = None
+
+	@property
+	def total_entries(self):
+		return self._total_entries
+
+	@property
+	def exported_entries(self):
+		return self._exported_entries
+
+	def _preserve_entry(self, entry_node):
+		strings = self._xml_get_entry_strings(entry_node)
+		for included_keyword in self._args.tag:
+			if included_keyword in strings:
+				return True
+		return False
+
+	def _xml_get_group_name(self, group_node):
+		return group_node.find("Name").text
+
+	def _xml_group_is_recycle_bin(self, group_node):
+		return group_node.find("UUID").text == self._recycle_bin_uuid
+
+	def _xml_get_entry_strings(self, entry_node):
+		strings = { }
+		for string_node in entry_node.findall("String"):
+			key = string_node.find("Key").text
+			if key in [ "Notes", "Password", "Title", "URL", "UserName", "TOTP Seed", "TOTP Settings" ]:
+				continue
+			strings[key] = string_node.find("Value").text
+		return strings
+
+	def _filter_groups(self, parent):
+		total_group_entries = 0
+		for group_node in parent.findall("Group"):
+			if self._xml_group_is_recycle_bin(group_node):
+				# Delete directly, never export historic entries
+				parent.remove(group_node)
+				continue
+
+			group_entries = 0
+			child_entries = self._filter_groups(group_node)
+			for entry in group_node.findall("Entry"):
+				self._total_entries += 1
+				if not self._preserve_entry(entry):
+					group_node.remove(entry)
+				else:
+					self._exported_entries += 1
+					group_entries += 1
+
+			#print("Group %s: %d direct entries, %d subgroup entries, %d total." % (self._xml_get_group_name(group_node), group_entries, child_entries, group_entries + child_entries))
+			total_group_entries += group_entries + child_entries
+			if group_entries + child_entries == 0:
+				# No direct entries nor entries in subgroups.
+				parent.remove(group_node)
+		return total_group_entries
+
+	def filter(self, xml_root):
+		meta_node = xml_root.find("Meta")
+		recycle_bin_uuid_node = meta_node.find("RecycleBinUUID")
+		if recycle_bin_uuid_node is not None:
+			self._recycle_bin_uuid = recycle_bin_uuid_node.text
+			meta_node.remove(recycle_bin_uuid_node)
+
+		root_node = xml_root.find("Root")
+		self._filter_groups(root_node)
+		xml_str = b"<?xml version=\"1.0\" ?>" + xml.etree.ElementTree.tostring(xml_root)
+		return xml_str
+
+if os.path.exists(args.outfile):
+	if args.force:
+		os.unlink(args.outfile)
+
+passphrase = getpass.getpass("Database passphrase: ")
+
+proc = subprocess.Popen([ args.keepass_cli_binary, "export", args.infile ], stdin = subprocess.PIPE, stdout = subprocess.PIPE)
+(stdout, stderr) = proc.communicate((passphrase + "\n").encode())
+stdout = stdout.decode()
+if "<?xml" not in stdout:
+	print("Could not find XML output in keepassxc-cli exported data, aborting.", file = sys.stderr)
+	sys.exit(1)
+
+
+index = stdout.find("<?xml")
+xml_str = stdout[index:]
+xml_root = xml.etree.ElementTree.fromstring(xml_str)
+
+if args.export_debug_data:
+	outfile = args.tempdir + "/export_prefilter.xml"
+	print("Exporting unencrypted debugging data to %s -- make sure to delete afterwards!" % (outfile))
+	with open(outfile, "w") as f:
+		f.write(xml_str)
+
+xml_filter = XMLFilter(args)
+xml_data = xml_filter.filter(xml_root)
+
+if args.export_debug_data:
+	outfile = args.tempdir + "/export_postfilter.xml"
+	print("Exporting unencrypted debugging data to %s -- make sure to delete afterwards!" % (outfile))
+	with open(outfile, "wb") as f:
+		f.write(xml_data)
+
+if xml_filter.exported_entries == 0:
+	print("No entries preserved/exported, aborting.", file = sys.stderr)
+	sys.exit(1)
+print("Exported %d of %d entries." % (xml_filter.exported_entries, xml_filter.total_entries))
+
+with tempfile.NamedTemporaryFile(prefix = "keepass_export_", suffix = ".xml", dir = args.tempdir) as f:
+	f.write(xml_data)
+	f.flush()
+	proc = subprocess.Popen([ args.keepass_cli_binary, "import", f.name, args.outfile ], stdin = subprocess.PIPE, stdout = subprocess.DEVNULL)
+	(stdout, stderr) = proc.communicate((passphrase + "\n").encode())
